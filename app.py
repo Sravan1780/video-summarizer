@@ -4,6 +4,7 @@ import os
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse, parse_qs
+from googletrans import Translator
 
 # Load environment variables
 load_dotenv()
@@ -46,6 +47,25 @@ D. Potential Further Exploration
 
 Respond in a structured, clear manner."""
 
+# Language support
+LANGUAGE_OPTIONS = {
+    'English': 'en',
+    'Spanish': 'es',
+    'French': 'fr',
+    'German': 'de',
+    'Japanese': 'ja',
+    'Chinese (Simplified)': 'zh-cn',
+    'Hindi': 'hi',
+    'Arabic': 'ar',
+    'Russian': 'ru',
+    'Portuguese': 'pt',
+    'Korean': 'ko',
+    'Italian': 'it'
+}
+
+# Initialize the translator
+translator = Translator()
+
 # Initialize session state
 def init_session_state():
     if "summary" not in st.session_state:
@@ -56,6 +76,10 @@ def init_session_state():
         st.session_state.video_link = ""
     if "video_title" not in st.session_state:
         st.session_state.video_title = ""
+    if "language" not in st.session_state:
+        st.session_state.language = "en"
+    if "transcript_language" not in st.session_state:
+        st.session_state.transcript_language = "en"
 
 # Extract YouTube Video ID from URL
 def extract_video_id(youtube_url):
@@ -69,25 +93,51 @@ def extract_video_id(youtube_url):
     except Exception:
         return None
 
-# Get transcript from YouTube
-def extract_transcript_details(youtube_video_url):
+# Get transcript from YouTube with language support
+def extract_transcript_details(youtube_video_url, language_code='en'):
     try:
         video_id = extract_video_id(youtube_video_url)
         if not video_id:
             st.error("Invalid YouTube URL")
             return None, None
 
-        # Fetch transcript
-        transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-        transcript = " ".join([item["text"] for item in transcript_data])
+        # Fetch transcript with language options
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        
+        try:
+            # Try to get the transcript in the requested language
+            transcript = transcript_list.find_transcript([language_code])
+            st.success(f"Found native transcript in selected language")
+        except:
+            try:
+                # If not available, try to get auto-generated and translate it
+                original_transcript = transcript_list.find_generated_transcript(['en'])
+                transcript = original_transcript.translate(language_code)
+                st.info(f"Using YouTube's translated transcript")
+            except Exception as e:
+                st.warning(f"Could not find transcript in selected language. Using available transcript.")
+                # Get any available transcript
+                transcript = next(iter(transcript_list))
+        
+        transcript_data = transcript.fetch()
+        transcript_text = " ".join([item["text"] for item in transcript_data])
 
-        # Attempt to get video title (this might require YouTube Data API, which is not implemented here)
-        video_title = "YouTube Video"
-
-        return transcript, video_title
+        return transcript_text, video_id
     except Exception as e:
         st.error(f"Error extracting transcript: {str(e)}")
         return None, None
+
+# Translate text using googletrans library
+def translate_text(text, target_language='en'):
+    if not text or target_language == 'en':
+        return text
+        
+    try:
+        result = translator.translate(text, dest=target_language)
+        return result.text
+    except Exception as e:
+        st.error(f"Translation error: {str(e)}")
+        return text
 
 # Generate summary using Google Gemini AI
 def generate_gemini_summary(transcript_text):
@@ -100,11 +150,15 @@ def generate_gemini_summary(transcript_text):
         return "Unable to generate summary."
 
 # Enhanced Chatbot AI response function
-def get_ai_response(question, summary):
+def get_ai_response(question, summary, target_language='en'):
     try:
         model = genai.GenerativeModel("gemini-2.0-pro-exp")
         formatted_prompt = QUESTION_PROMPT.format(summary=summary, question=question)
         response = model.generate_content(formatted_prompt)
+        
+        # Translate response if needed
+        if target_language != 'en':
+            return translate_text(response.text, target_language)
         return response.text
     except Exception as e:
         st.error(f"Error generating response: {str(e)}")
@@ -116,7 +170,31 @@ def main():
     init_session_state()
 
     # Main App Title
-    st.title("🎥 Advanced YouTube Video Analyzer & Chatbot")
+    st.title("🎥 Multilingual YouTube Video Analyzer & Chatbot")
+    
+    # Sidebar for settings
+    with st.sidebar:
+        st.header("Settings")
+        
+        # Transcript language selection
+        transcript_language = st.selectbox(
+            "Select transcript language:",
+            options=list(LANGUAGE_OPTIONS.keys()),
+            format_func=lambda x: x,
+            index=list(LANGUAGE_OPTIONS.keys()).index("English")
+        )
+        # Store language code in session state
+        st.session_state.transcript_language = LANGUAGE_OPTIONS[transcript_language]
+        
+        # Interface language selection
+        interface_language = st.selectbox(
+            "Select interface language:",
+            options=list(LANGUAGE_OPTIONS.keys()),
+            format_func=lambda x: x,
+            index=list(LANGUAGE_OPTIONS.keys()).index("English")
+        )
+        # Store language code in session state
+        st.session_state.language = LANGUAGE_OPTIONS[interface_language]
 
     # YouTube Link Input
     youtube_link = st.text_input("Enter YouTube Video Link:", 
@@ -134,32 +212,45 @@ def main():
 
     # Generate Summary Button
     if st.button("Analyze Video"):
-        with st.spinner("Fetching transcript and generating comprehensive analysis..."):
+        with st.spinner(f"Fetching transcript and generating analysis..."):
             # Reset chat messages
             st.session_state.chat_messages = []
             
-            # Extract transcript
-            transcript_text, video_title = extract_transcript_details(youtube_link)
+            # Extract transcript with selected language
+            transcript_text, video_id = extract_transcript_details(youtube_link, st.session_state.transcript_language)
 
             if transcript_text:
                 # Generate summary
                 summary = generate_gemini_summary(transcript_text)
                 
+                # Translate summary if interface language is different
+                if st.session_state.language != 'en':
+                    summary = translate_text(summary, st.session_state.language)
+                
                 # Store summary in session state
                 st.session_state.summary = summary
-                st.session_state.video_title = video_title
+                st.session_state.video_title = f"YouTube Video (ID: {video_id})"
                 
                 # Success message
-                st.success("Video analysis completed successfully!")
+                success_msg = "Video analysis completed successfully!"
+                if st.session_state.language != 'en':
+                    success_msg = translate_text(success_msg, st.session_state.language)
+                st.success(success_msg)
 
     # Display Summary
     if st.session_state.summary:
-        st.markdown("## 📌 Comprehensive Video Analysis:")
+        summary_title = "📌 Comprehensive Video Analysis:"
+        if st.session_state.language != 'en':
+            summary_title = translate_text(summary_title, st.session_state.language)
+        st.markdown(f"## {summary_title}")
         st.write(st.session_state.summary)
 
     # Chat Interface
     if st.session_state.summary:
-        st.markdown("## 💬 Interactive Video Insights")
+        chat_title = "💬 Interactive Video Insights"
+        if st.session_state.language != 'en':
+            chat_title = translate_text(chat_title, st.session_state.language)
+        st.markdown(f"## {chat_title}")
 
         # Display existing chat messages
         for msg in st.session_state.chat_messages:
@@ -167,13 +258,29 @@ def main():
             st.chat_message("assistant").write(msg['answer'])
 
         # Question Input
-        current_question = st.chat_input("Ask a detailed question about the video or topic")
+        placeholder_text = "Ask a detailed question about the video or topic"
+        if st.session_state.language != 'en':
+            placeholder_text = translate_text(placeholder_text, st.session_state.language)
+        current_question = st.chat_input(placeholder_text)
 
         # Generate Response when question is asked
         if current_question:
-            with st.spinner("Generating comprehensive response..."):
-                # Generate AI response
-                ai_response = get_ai_response(current_question, st.session_state.summary)
+            # Translate question to English if needed
+            question_for_ai = current_question
+            if st.session_state.language != 'en':
+                question_for_ai = translate_text(current_question, 'en')
+                
+            spinner_text = "Generating comprehensive response..."
+            if st.session_state.language != 'en':
+                spinner_text = translate_text(spinner_text, st.session_state.language)
+                
+            with st.spinner(spinner_text):
+                # Generate AI response with translation if needed
+                ai_response = get_ai_response(
+                    question_for_ai, 
+                    st.session_state.summary if st.session_state.language == 'en' else translate_text(st.session_state.summary, 'en'),
+                    st.session_state.language
+                )
 
                 # Add to chat history
                 st.session_state.chat_messages.append({
