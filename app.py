@@ -4,6 +4,8 @@ import os
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse, parse_qs
+from googletrans import Translator
+import time
 
 # Load environment variables
 load_dotenv()
@@ -44,39 +46,16 @@ B. Expanded Context
 C. Additional Insights
 D. Potential Further Exploration
 
-Respond in a structured, clear manner."""
+Respond in a structured, clear manner in the {language} language."""
 
-TRANSLATION_PROMPT = """Translate the following text from {source_language} to {target_language}:
-
-{text}
-
-Provide only the translated text, with no additional comments or explanations."""
-
-UI_STRINGS = {
-    "en": {
-        "title": "🎥 Multilingual YouTube Video Analyzer & Chatbot",
-        "settings": "Settings",
-        "select_transcript_lang": "Select transcript language:",
-        "select_interface_lang": "Select interface language:",
-        "enter_url": "Enter YouTube Video Link:",
-        "analyze_btn": "Analyze Video",
-        "loading_msg": "Fetching transcript and generating analysis...",
-        "success_msg": "Video analysis completed successfully!",
-        "summary_title": "📌 Comprehensive Video Analysis:",
-        "chat_title": "💬 Interactive Video Insights",
-        "ask_placeholder": "Ask a detailed question about the video or topic",
-        "generating_msg": "Generating comprehensive response..."
-    }
-}
-
-# Language support - add translations for UI elements as needed
+# Language support
 LANGUAGE_OPTIONS = {
     'English': 'en',
     'Spanish': 'es',
     'French': 'fr',
     'German': 'de',
     'Japanese': 'ja',
-    'Chinese': 'zh',
+    'Chinese (Simplified)': 'zh-cn',
     'Hindi': 'hi',
     'Arabic': 'ar',
     'Russian': 'ru',
@@ -85,10 +64,37 @@ LANGUAGE_OPTIONS = {
     'Italian': 'it'
 }
 
-# Add basic UI strings for each language
-for lang_code in LANGUAGE_OPTIONS.values():
-    if lang_code != 'en' and lang_code not in UI_STRINGS:
-        UI_STRINGS[lang_code] = UI_STRINGS['en']  # Default to English
+# Map of language codes to full language names
+LANGUAGE_NAMES = {
+    'en': 'English',
+    'es': 'Spanish',
+    'fr': 'French',
+    'de': 'German',
+    'ja': 'Japanese',
+    'zh-cn': 'Chinese',
+    'hi': 'Hindi',
+    'ar': 'Arabic',
+    'ru': 'Russian',
+    'pt': 'Portuguese',
+    'ko': 'Korean',
+    'it': 'Italian'
+}
+
+# Initialize the translator with retry mechanism
+def get_translator():
+    for _ in range(3):
+        try:
+            return Translator(service_urls=[
+                'translate.google.com',
+                'translate.google.co.kr',
+                'translate.google.co.jp'
+            ])
+        except:
+            time.sleep(1)
+    # Fallback
+    return Translator()
+
+translator = get_translator()
 
 # Initialize session state
 def init_session_state():
@@ -104,6 +110,10 @@ def init_session_state():
         st.session_state.language = "en"
     if "transcript_language" not in st.session_state:
         st.session_state.transcript_language = "en"
+    if "translation_cache" not in st.session_state:
+        st.session_state.translation_cache = {}
+    if "debug_info" not in st.session_state:
+        st.session_state.debug_info = ""
 
 # Extract YouTube Video ID from URL
 def extract_video_id(youtube_url):
@@ -122,7 +132,8 @@ def extract_transcript_details(youtube_video_url, language_code='en'):
     try:
         video_id = extract_video_id(youtube_video_url)
         if not video_id:
-            st.error("Invalid YouTube URL")
+            error_msg = "Invalid YouTube URL"
+            st.error(translate_ui_text(error_msg, st.session_state.language))
             return None, None
 
         # Fetch transcript with language options
@@ -131,15 +142,18 @@ def extract_transcript_details(youtube_video_url, language_code='en'):
         try:
             # Try to get the transcript in the requested language
             transcript = transcript_list.find_transcript([language_code])
-            st.success(f"Found native transcript in selected language")
+            success_msg = f"Found native transcript in selected language"
+            st.success(translate_ui_text(success_msg, st.session_state.language))
         except:
             try:
                 # If not available, try to get auto-generated and translate it
                 original_transcript = transcript_list.find_generated_transcript(['en'])
                 transcript = original_transcript.translate(language_code)
-                st.info(f"Using YouTube's translated transcript")
+                info_msg = f"Using YouTube's translated transcript"
+                st.info(translate_ui_text(info_msg, st.session_state.language))
             except Exception as e:
-                st.warning(f"Could not find transcript in selected language. Using available transcript.")
+                warning_msg = f"Could not find transcript in selected language. Using available transcript."
+                st.warning(translate_ui_text(warning_msg, st.session_state.language))
                 # Get any available transcript
                 transcript = next(iter(transcript_list))
         
@@ -148,25 +162,75 @@ def extract_transcript_details(youtube_video_url, language_code='en'):
 
         return transcript_text, video_id
     except Exception as e:
-        st.error(f"Error extracting transcript: {str(e)}")
+        error_msg = f"Error extracting transcript: {str(e)}"
+        st.error(translate_ui_text(error_msg, st.session_state.language))
         return None, None
 
-# Translate text using Gemini
-def translate_with_gemini(text, source_language='en', target_language='en'):
-    if not text or source_language == target_language:
-        return text
+# More robust language detection
+def is_english(text):
+    if not text or len(text) < 10:
+        return True
         
     try:
-        model = genai.GenerativeModel("gemini-2.0-pro-exp")
-        prompt = TRANSLATION_PROMPT.format(
-            source_language=source_language,
-            target_language=target_language,
-            text=text
-        )
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        st.error(f"Translation error: {str(e)}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Use a sample of the text for faster detection
+                sample = text[:150] if len(text) > 150 else text
+                detected = translator.detect(sample)
+                return detected.lang == 'en'
+            except Exception:
+                if attempt == max_retries - 1:
+                    return False
+                time.sleep(1)
+    except:
+        return False
+
+# Translate text using googletrans with caching and retry
+def translate_text(text, target_language='en'):
+    # Skip translation if not needed
+    if not text or target_language == 'en' and is_english(text):
+        return text
+    
+    # Check cache first
+    cache_key = f"{text[:50]}_{target_language}"  # Use first 50 chars as key to avoid huge keys
+    if cache_key in st.session_state.translation_cache:
+        return st.session_state.translation_cache[cache_key]
+        
+    try:
+        # Retry mechanism for more reliable translations
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = translator.translate(text, dest=target_language)
+                translated_text = result.text
+                # Save to cache
+                st.session_state.translation_cache[cache_key] = translated_text
+                return translated_text
+            except Exception:
+                if attempt == max_retries - 1:
+                    # Last attempt failed, return original
+                    return text
+                # Wait before retrying with exponential backoff
+                time.sleep(1 * (attempt + 1))
+    except Exception:
+        return text  # Return original text if translation fails
+
+# Helper function to translate UI text
+def translate_ui_text(text, target_language='en'):
+    if target_language == 'en':
+        return text
+    
+    # Check cache
+    cache_key = f"ui_{text}_{target_language}"
+    if cache_key in st.session_state.translation_cache:
+        return st.session_state.translation_cache[cache_key]
+    
+    try:
+        translated = translator.translate(text, dest=target_language).text
+        st.session_state.translation_cache[cache_key] = translated
+        return translated
+    except:
         return text
 
 # Generate summary using Google Gemini AI
@@ -176,63 +240,59 @@ def generate_gemini_summary(transcript_text):
         response = model.generate_content(SUMMARY_PROMPT + transcript_text)
         return response.text
     except Exception as e:
-        st.error(f"Error generating summary: {str(e)}")
-        return "Unable to generate summary."
+        error_msg = f"Error generating summary: {str(e)}"
+        st.error(translate_ui_text(error_msg, st.session_state.language))
+        return translate_ui_text("Unable to generate summary.", st.session_state.language)
 
-# Enhanced Chatbot AI response function with translation
+# Enhanced Chatbot AI response function with direct language instruction
 def get_ai_response(question, summary, target_language='en'):
     try:
+        # Add language instruction directly in the prompt
+        language_name = LANGUAGE_NAMES.get(target_language, 'English')
+        
+        # Generate response with explicit language instruction
         model = genai.GenerativeModel("gemini-2.0-pro-exp")
-        
-        # Ensure the question is in English for processing
-        question_in_english = question
-        if target_language != 'en':
-            question_in_english = translate_with_gemini(question, target_language, 'en')
-            
-        # Ensure the summary is in English for processing
-        summary_in_english = summary
-        if target_language != 'en':
-            summary_in_english = translate_with_gemini(summary, target_language, 'en')
-        
         formatted_prompt = QUESTION_PROMPT.format(
-            summary=summary_in_english, 
-            question=question_in_english
+            summary=summary, 
+            question=question,
+            language=language_name
         )
         
         response = model.generate_content(formatted_prompt)
+        response_text = response.text
         
-        # Translate response if needed
-        if target_language != 'en':
-            return translate_with_gemini(response.text, 'en', target_language)
-        return response.text
+        # If response not in target language, force translation
+        if target_language != 'en' and is_english(response_text):
+            response_text = translate_text(response_text, target_language)
+            
+        return response_text
     except Exception as e:
-        st.error(f"Error generating response: {str(e)}")
-        return "Sorry, I couldn't generate a comprehensive response."
-
-# Get localized UI string
-def get_ui_string(key, language='en'):
-    if language in UI_STRINGS and key in UI_STRINGS[language]:
-        return UI_STRINGS[language][key]
-    return UI_STRINGS['en'][key]
+        error_msg = f"Error generating response: {str(e)}"
+        translated_error = translate_ui_text(error_msg, target_language)
+        st.error(translated_error)
+        
+        sorry_msg = "Sorry, I couldn't generate a comprehensive response."
+        translated_sorry = translate_ui_text(sorry_msg, target_language)
+        return translated_sorry
 
 # Main Streamlit Application
 def main():
     # Initialize session state
     init_session_state()
-    
-    # Get current language
-    current_lang = st.session_state.language
 
     # Main App Title
-    st.title(get_ui_string('title', current_lang))
+    app_title = "🎥 Multilingual YouTube Video Analyzer & Chatbot"
+    st.title(translate_ui_text(app_title, st.session_state.language))
     
     # Sidebar for settings
     with st.sidebar:
-        st.header(get_ui_string('settings', current_lang))
+        settings_header = "Settings"
+        st.header(translate_ui_text(settings_header, st.session_state.language))
         
         # Transcript language selection
+        transcript_label = "Select transcript language:"
         transcript_language = st.selectbox(
-            get_ui_string('select_transcript_lang', current_lang),
+            translate_ui_text(transcript_label, st.session_state.language),
             options=list(LANGUAGE_OPTIONS.keys()),
             format_func=lambda x: x,
             index=list(LANGUAGE_OPTIONS.keys()).index("English")
@@ -241,21 +301,25 @@ def main():
         st.session_state.transcript_language = LANGUAGE_OPTIONS[transcript_language]
         
         # Interface language selection
+        interface_label = "Select interface language:"
         interface_language = st.selectbox(
-            get_ui_string('select_interface_lang', current_lang),
+            translate_ui_text(interface_label, st.session_state.language),
             options=list(LANGUAGE_OPTIONS.keys()),
             format_func=lambda x: x,
             index=list(LANGUAGE_OPTIONS.keys()).index("English")
         )
         # Store language code in session state
-        new_lang = LANGUAGE_OPTIONS[interface_language]
-        if new_lang != current_lang:
-            st.session_state.language = new_lang
-            st.rerun()  # Refresh to update UI language
+        st.session_state.language = LANGUAGE_OPTIONS[interface_language]
+        
+        # Clear cache button
+        if st.button(translate_ui_text("Clear Translation Cache", st.session_state.language)):
+            st.session_state.translation_cache = {}
+            st.success(translate_ui_text("Cache cleared!", st.session_state.language))
 
     # YouTube Link Input
+    youtube_label = "Enter YouTube Video Link:"
     youtube_link = st.text_input(
-        get_ui_string('enter_url', current_lang),
+        translate_ui_text(youtube_label, st.session_state.language),
         value=st.session_state.video_link, 
         key="youtube_link_input"
     )
@@ -270,40 +334,42 @@ def main():
             st.image(f"http://img.youtube.com/vi/{video_id}/0.jpg", use_container_width=True)
 
     # Generate Summary Button
-    if st.button(get_ui_string('analyze_btn', current_lang)):
-        with st.spinner(get_ui_string('loading_msg', current_lang)):
+    analyze_btn_text = "Analyze Video"
+    if st.button(translate_ui_text(analyze_btn_text, st.session_state.language)):
+        spinner_text = "Fetching transcript and generating analysis..."
+        with st.spinner(translate_ui_text(spinner_text, st.session_state.language)):
             # Reset chat messages
             st.session_state.chat_messages = []
             
             # Extract transcript with selected language
-            transcript_text, video_id = extract_transcript_details(
-                youtube_link, 
-                st.session_state.transcript_language
-            )
+            transcript_text, video_id = extract_transcript_details(youtube_link, st.session_state.transcript_language)
 
             if transcript_text:
-                # Generate summary (in English initially)
+                # Generate summary
                 summary = generate_gemini_summary(transcript_text)
                 
                 # Translate summary if interface language is different
-                if current_lang != 'en':
-                    summary = translate_with_gemini(summary, 'en', current_lang)
+                if st.session_state.language != 'en':
+                    summary = translate_text(summary, st.session_state.language)
                 
                 # Store summary in session state
                 st.session_state.summary = summary
                 st.session_state.video_title = f"YouTube Video (ID: {video_id})"
                 
                 # Success message
-                st.success(get_ui_string('success_msg', current_lang))
+                success_msg = "Video analysis completed successfully!"
+                st.success(translate_ui_text(success_msg, st.session_state.language))
 
     # Display Summary
     if st.session_state.summary:
-        st.markdown(f"## {get_ui_string('summary_title', current_lang)}")
+        summary_title = "📌 Comprehensive Video Analysis:"
+        st.markdown(f"## {translate_ui_text(summary_title, st.session_state.language)}")
         st.write(st.session_state.summary)
 
     # Chat Interface
     if st.session_state.summary:
-        st.markdown(f"## {get_ui_string('chat_title', current_lang)}")
+        chat_title = "💬 Interactive Video Insights"
+        st.markdown(f"## {translate_ui_text(chat_title, st.session_state.language)}")
 
         # Display existing chat messages
         for msg in st.session_state.chat_messages:
@@ -311,26 +377,33 @@ def main():
             st.chat_message("assistant").write(msg['answer'])
 
         # Question Input
-        current_question = st.chat_input(get_ui_string('ask_placeholder', current_lang))
+        placeholder_text = "Ask a detailed question about the video or topic"
+        current_question = st.chat_input(
+            translate_ui_text(placeholder_text, st.session_state.language)
+        )
 
         # Generate Response when question is asked
         if current_question:
-            with st.spinner(get_ui_string('generating_msg', current_lang)):
-                # Generate AI response with translation if needed
+            # Display the user's question immediately
+            st.chat_message("user").write(current_question)
+            
+            spinner_text = "Generating comprehensive response..."
+            with st.spinner(translate_ui_text(spinner_text, st.session_state.language)):
+                # Generate AI response using the selected language
                 ai_response = get_ai_response(
-                    current_question, 
+                    current_question,
                     st.session_state.summary,
-                    current_lang
+                    st.session_state.language
                 )
+
+                # Display the response
+                st.chat_message("assistant").write(ai_response)
 
                 # Add to chat history
                 st.session_state.chat_messages.append({
                     'question': current_question,
                     'answer': ai_response
                 })
-
-                # Rerun to display the new message
-                st.rerun()
 
 # Run the application
 if __name__ == "__main__":
